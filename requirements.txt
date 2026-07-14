@@ -1,7 +1,6 @@
-import warnings
-import joblib
-import numpy
-import pandas
-import plotly.express
-import sklearn
-import streamlit
+streamlit
+pandas
+numpy
+plotly
+scikit-learn
+joblib
