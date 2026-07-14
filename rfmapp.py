@@ -172,7 +172,7 @@ def process_mapped_sales_data(
 
 
 # --- FRONTEND UI ---
-st.title("🚀 RFM Customer Segmentation Dashboard")
+st.title("RFM Customer Segmentation Dashboard")
 st.markdown(
     "Upload raw transaction data to automatically clean, aggregate, and group customers into segments."
 )
