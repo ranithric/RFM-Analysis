@@ -1,57 +1,37 @@
-import warnings
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import sklearn  # Pre-loading sklearn prevents joblib load freezes
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 import streamlit as st
-
-# Suppress version mismatch warnings
-warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="RFM Customer Segmentation Engine",
+    page_title="Universal RFM Customer Segmentation Engine",
     layout="wide",
 )
 
-# --- LOAD TRAINED ARTIFACTS ---
 
-
-@st.cache_resource
-def load_models():
-    scaler = joblib.load("scaler.pkl")
-    kmeans = joblib.load("kmeans_model.pkl")
-    return scaler, kmeans
-
-
-scaler, kmeans = load_models()
-
-
-# --- HELPER FUNCTION FOR SYNTHETIC DATA GENERATION ---
+# --- HELPER FUNCTION FOR SYNTHETIC DEMO DATA GENERATION ---
 def generate_synthetic_data(num_rows=1000, num_customers=150):
-    """Generates realistic e-commerce transaction data for demonstration."""
+    """Generates a clean preprocessed transaction dataset for demonstration."""
     np.random.seed(42)
 
     customer_ids = [f"CUST-{1000 + i}" for i in range(num_customers)]
     order_ids = [f"INV-{50000 + i}" for i in range(300)]
-
     dates = pd.date_range(end="2026-06-30", periods=365, freq="D")
 
     data = {
-        "InvoiceNo": np.random.choice(order_ids, num_rows),
         "CustomerID": np.random.choice(customer_ids, num_rows),
-        "InvoiceDate": np.random.choice(dates, num_rows),
-        "UnitPrice": np.round(np.random.exponential(scale=25.0, size=num_rows) + 1.5, 2),
+        "OrderDate": np.random.choice(dates, num_rows),
+        "OrderID": np.random.choice(order_ids, num_rows),
+        "UnitPrice": np.round(
+            np.random.exponential(scale=25.0, size=num_rows) + 1.5, 2
+        ),
         "Quantity": np.random.randint(1, 12, size=num_rows),
     }
 
-    df = pd.DataFrame(data)
-    # Inject a few cancellation invoices for realism
-    cancel_indices = np.random.choice(df.index, size=int(num_rows * 0.05), replace=False)
-    df.loc[cancel_indices, "InvoiceNo"] = "C" + df.loc[cancel_indices, "InvoiceNo"].astype(str)
-
-    return df
+    return pd.DataFrame(data)
 
 
 # --- HELPER FUNCTION FOR SMART COLUMN MATCHING ---
@@ -63,12 +43,22 @@ def find_default(candidates, cols):
     return 0
 
 
-# --- BACKEND PROCESSING & PREPROCESSING FUNCTION ---
-def process_mapped_sales_data(
-    df, id_col, date_col, order_col, price_col, qty_col, scaler_obj, kmeans_model_obj
+# --- DYNAMIC RFM & K-MEANS PIPELINE ---
+def process_dynamic_rfm(
+    df, id_col, date_col, order_col, price_col, qty_col, n_clusters=4
 ):
-    # 1. Select and Rename Columns
-    clean_df = df[[id_col, date_col, order_col, price_col, qty_col]].copy()
+    """Aggregates RFM metrics, log-transforms, scales, and fits K-Means dynamically."""
+    # 1. Column Selection & Validation Check
+    mapped_cols = [id_col, date_col, order_col, price_col, qty_col]
+
+    # Guardrail: Ensure unique column mappings
+    if len(set(mapped_cols)) < 5:
+        st.error(
+            "⚠️ **Mapping Error:** Please select 5 unique columns. Two or more dropdowns are set to the same header."
+        )
+        return None
+
+    clean_df = df[mapped_cols].copy()
     clean_df.columns = [
         "CustomerID",
         "OrderDate",
@@ -77,51 +67,27 @@ def process_mapped_sales_data(
         "Quantity",
     ]
 
-    # 2. Data Preprocessing Pipeline (Notebook Alignment)
-    # A. Remove returned products (Invoice numbers starting with / containing 'C')
-    clean_df["OrderID"] = clean_df["OrderID"].astype(str).str.strip()
-    clean_df = clean_df[~clean_df["OrderID"].str.contains("C", case=False, na=False)]
-
-    # B. Remove missing values from the dataset
-    clean_df = clean_df.dropna()
-
-    # C. Clean UnitPrice & Quantity fields
-    if clean_df["UnitPrice"].dtype == "object":
-        clean_df["UnitPrice"] = (
-            clean_df["UnitPrice"]
-            .astype(str)
-            .str.replace(r"[^\d.-]", "", regex=True)
-        )
-    clean_df["UnitPrice"] = pd.to_numeric(clean_df["UnitPrice"], errors="coerce")
-
-    if clean_df["Quantity"].dtype == "object":
-        clean_df["Quantity"] = (
-            clean_df["Quantity"]
-            .astype(str)
-            .str.replace(r"[^\d.-]", "", regex=True)
-        )
-    clean_df["Quantity"] = pd.to_numeric(clean_df["Quantity"], errors="coerce")
-
-    # D. Drop any NaNs resulting from numeric coercion & filter out negative/zero values
-    clean_df = clean_df.dropna()
-    clean_df["CustomerID"] = clean_df["CustomerID"].astype(str).str.strip()
-    clean_df = clean_df[(clean_df["Quantity"] > 0) & (clean_df["UnitPrice"] > 0)]
-
-    # E. Parse Dates Safely
-    clean_df["OrderDate"] = pd.to_datetime(clean_df["OrderDate"], errors="coerce")
-    clean_df = clean_df.dropna(subset=["OrderDate"])
-
-    # Verify rows remain after cleaning
-    if clean_df.empty:
+    # Guardrail: Check for missing values
+    missing_count = clean_df.isna().sum().sum()
+    if missing_count > 0:
         st.error(
-            "❌ Cleaning failed: No valid data remaining after filtering cancellations, invalid dates, prices, or quantities."
+            f"❌ **Data Ingestion Error:** Found {missing_count} missing (NaN) values in mapped columns. "
+            "Please upload a dataset with zero missing values or clean your file before uploading."
         )
         return None
 
-    # F. Compute Total Sales Amount
+    # Parse dates safely
+    clean_df["OrderDate"] = pd.to_datetime(clean_df["OrderDate"], errors="coerce")
+    if clean_df["OrderDate"].isna().sum() > 0:
+        st.error(
+            "❌ **Date Formatting Error:** Some values in your Order Date column could not be parsed as dates."
+        )
+        return None
+
+    # Calculate Total Sales Amount
     clean_df["SalesAmount"] = clean_df["UnitPrice"] * clean_df["Quantity"]
 
-    # 3. Calculate RFM Metrics
+    # 2. Calculate RFM Metrics
     reference_date = clean_df["OrderDate"].max() + pd.Timedelta(days=1)
 
     rfm = (
@@ -139,58 +105,71 @@ def process_mapped_sales_data(
     rfm.columns = ["CustomerID", "Recency", "Frequency", "Monetary"]
 
     if rfm.empty:
-        st.error("❌ Aggregation failed: No customer records produced.")
+        st.error("❌ Aggregation failed: No valid records found.")
         return None
 
-    # 4. Transform & Predict Clusters (Matches notebook sequence)
+    # 3. Feature Transformation (Log1p -> Dynamic Standard Scaling)
     X = rfm[["Recency", "Frequency", "Monetary"]]
 
-    # Step 1: Scale features using loaded scaler
-    rfm_scaled_array = scaler_obj.transform(X)
-    rfm_normalized = pd.DataFrame(rfm_scaled_array, columns=X.columns, index=X.index)
+    # Log Transformation to handle skewness
+    X_log = np.log1p(X)
 
-    # Step 2: Log transform scaled values (log1p)
-    rfm_log_transformed = np.log1p(rfm_normalized)
+    # Dynamic Standard Scaling
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_log)
 
-    # Step 3: Predict clusters using KMeans model
-    rfm["Cluster"] = kmeans_model_obj.predict(rfm_log_transformed)
+    # 4. Dynamic K-Means Clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    rfm["Cluster"] = kmeans.fit_predict(X_scaled)
 
-    # 4-Cluster Persona Definitions
-    cluster_labels = {
-        0: "Warm Leads / Potential Churners",
-        1: "Lost / Very Lapsed Customers",
-        2: "Champions / High-Value Loyal Customers",
-        3: "Hibernating / Slipping Customers",
+    # 5. Relative Persona Mapping (Ranks clusters by average Monetary spend)
+    monetary_rank = (
+        rfm.groupby("Cluster")["Monetary"].mean().sort_values().index.tolist()
+    )
+
+    persona_map = {
+        monetary_rank[0]: "Lost / Very Lapsed Customers",
+        monetary_rank[1]: "Hibernating / Slipping Customers",
+        monetary_rank[2]: "Warm Leads / Potential Churners",
+        monetary_rank[3]: "Champions / High-Value Loyal Customers",
     }
 
-    # Map cluster numbers into human-readable persona names
-    rfm["Customer Segment"] = rfm["Cluster"].map(cluster_labels).fillna(
-        rfm["Cluster"].apply(lambda x: f"Cluster {x}")
-    )
+    rfm["Customer Segment"] = rfm["Cluster"].map(persona_map)
 
     return rfm
 
 
 # --- FRONTEND UI ---
-st.title("RFM Customer Segmentation Dashboard")
+st.title("Universal RFM Customer Segmentation Engine")
 st.markdown(
-    "Upload raw transaction data to automatically clean, aggregate, and group customers into segments."
+    "A dynamic machine learning dashboard that fits a K-Means model on the fly for any uploaded e-commerce dataset."
 )
+
+st.divider()
+
+# --- USER GUIDELINES CARD ---
+with st.expander("📋 **Dataset Requirements & Preparation Instructions (Click to Expand)**", expanded=True):
+    st.markdown("""
+    To ensure successful analysis, please ensure your uploaded CSV is **pre-cleaned** and structured according to the following guidelines:
+    
+    * **No Missing Values:** Ensure there are no empty (`NaN` / `null`) cells in your key transaction columns.
+    * **Positive Numeric Values:** `UnitPrice` and `Quantity` must be numeric, positive numbers ($> 0$). Remove currency symbols (e.g., `$`) or commas prior to upload.
+    * **Valid Dates:** Dates should be formatted consistently (e.g., `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`).
+    * **No Cancellations or Returns:** Exclude negative quantity transactions, returned item logs, or refund invoice numbers beforehand.
+    * **Required Information:** Your file must contain columns representing: **Customer ID**, **Order Date**, **Order ID / Invoice Number**, **Unit Price**, and **Quantity**.
+    """)
 
 st.divider()
 
 # Sidebar Setup
 st.sidebar.header("📁 Data Input")
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Transaction CSV", type=["csv"]
-)
+uploaded_file = st.sidebar.file_uploader("Upload Clean Transaction CSV", type=["csv"])
 
-# Demo / Synthetic Data Option
 st.sidebar.markdown("**OR**")
 if st.sidebar.button("🎲 Load Sample Demo Data"):
     st.session_state["raw_df"] = generate_synthetic_data()
-    st.session_state.pop("rfm_results", None)  # Reset previous results
-    st.sidebar.success("Loaded 1,000 synthetic transactions!")
+    st.session_state.pop("rfm_results", None)
+    st.sidebar.success("Loaded 1,000 clean synthetic transactions!")
 
 if uploaded_file is not None:
     st.session_state["raw_df"] = pd.read_csv(uploaded_file)
@@ -235,11 +214,11 @@ if "raw_df" in st.session_state:
             index=find_default(["qty", "quantity", "count"], columns),
         )
 
-    # Data Preview & Health Check Section
+    # Data Preview & Quality Summary
     st.divider()
     st.subheader("🔍 Dataset Overview & Health Check")
 
-    tab1, tab2 = st.tabs(["Raw Data Preview", "Data Quality & Types Summary"])
+    tab1, tab2 = st.tabs(["Raw Data Preview", "Data Summary"])
 
     with tab1:
         st.dataframe(raw_df.head(10), use_container_width=True)
@@ -248,7 +227,7 @@ if "raw_df" in st.session_state:
         m1, m2, m3 = st.columns(3)
         total_rows = len(raw_df)
         total_missing = raw_df[[id_col, date_col, order_col, price_col, qty_col]].isna().sum().sum()
-        
+
         m1.metric("Total Rows", f"{total_rows:,}")
         m2.metric("Total Columns", f"{len(columns):,}")
         m3.metric("Missing Cells (Mapped Fields)", f"{total_missing:,}")
@@ -262,26 +241,13 @@ if "raw_df" in st.session_state:
         }
 
         health_data = []
-        target_types = {
-            "Customer ID": "String",
-            "Order Date": "Datetime",
-            "Order ID": "String",
-            "Unit Price": "Float / Numeric",
-            "Quantity": "Integer / Numeric",
-        }
-
         for field_label, col_name in mapped_fields.items():
             missing_count = raw_df[col_name].isna().sum()
-            missing_pct = (missing_count / total_rows) * 100
-            curr_type = str(raw_df[col_name].dtype)
-
             health_data.append({
                 "Mapped Field": field_label,
                 "CSV Column Name": col_name,
-                "Original Data Type": curr_type,
-                "Target/Corrected Type": target_types[field_label],
+                "Data Type": str(raw_df[col_name].dtype),
                 "Missing Values": missing_count,
-                "Missing %": f"{missing_pct:.1f}%",
             })
 
         st.dataframe(pd.DataFrame(health_data), use_container_width=True)
@@ -289,9 +255,9 @@ if "raw_df" in st.session_state:
     st.divider()
 
     if st.button("🚀 Process & Segment Data", type="primary"):
-        with st.spinner("Cleaning formats & calculating clusters..."):
-            rfm_results = process_mapped_sales_data(
-                raw_df, id_col, date_col, order_col, price_col, qty_col, scaler, kmeans
+        with st.spinner("Training dynamic K-Means model & generating clusters..."):
+            rfm_results = process_dynamic_rfm(
+                raw_df, id_col, date_col, order_col, price_col, qty_col
             )
             st.session_state["rfm_results"] = rfm_results
 
@@ -324,22 +290,22 @@ if "rfm_results" in st.session_state and st.session_state["rfm_results"] is not 
 
         st.subheader("Frequency vs Spend (Log Scale)")
         fig_scatter = px.scatter(
-                rfm_df,
-                x="Frequency",
-                y="Monetary",
-                color="Customer Segment",
-                size="Recency",
-                hover_data=["CustomerID"],
-                log_x=True,
-                log_y=True,
-                color_discrete_sequence=px.colors.qualitative.Set2,
-            )
+            rfm_df,
+            x="Frequency",
+            y="Monetary",
+            color="Customer Segment",
+            size="Recency",
+            hover_data=["CustomerID"],
+            log_x=True,
+            log_y=True,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
         # Marketing Strategies Section
         st.divider()
         st.subheader("Recommended Marketing Strategies")
-        
+
         strat_col1, strat_col2 = st.columns(2)
 
         with strat_col1:
