@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 import streamlit as st
 
@@ -43,20 +44,51 @@ def find_default(candidates, cols):
     return 0
 
 
+# --- MODEL OPTIMIZATION CALCULATIONS (ELBOW & SILHOUETTE) ---
+def calculate_optimization_metrics(X_scaled, max_k=8):
+    """Computes WCSS (Inertia) and Silhouette Scores for K=2 to max_k."""
+    wcss = []
+    silhouette_scores = []
+    k_range = list(range(2, max_k + 1))
+
+    # K=1 WCSS calculation
+    km1 = KMeans(n_clusters=1, random_state=42, n_init=10)
+    km1.fit(X_scaled)
+    wcss_all = [km1.inertia_]
+
+    for k in k_range:
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = km.fit_predict(X_scaled)
+        wcss_all.append(km.inertia_)
+        score = silhouette_score(X_scaled, labels)
+        silhouette_scores.append(score)
+
+    df_elbow = pd.DataFrame(
+        {"Number of Clusters (K)": list(range(1, max_k + 1)), "WCSS": wcss_all}
+    )
+
+    df_silhouette = pd.DataFrame(
+        {
+            "Number of Clusters (K)": k_range,
+            "Silhouette Score": silhouette_scores,
+        }
+    )
+
+    return df_elbow, df_silhouette
+
+
 # --- DYNAMIC RFM & K-MEANS PIPELINE ---
 def process_dynamic_rfm(
     df, id_col, date_col, order_col, price_col, qty_col, n_clusters=4
 ):
     """Aggregates RFM metrics, log-transforms, scales, and fits K-Means dynamically."""
-    # 1. Column Selection & Validation Check
     mapped_cols = [id_col, date_col, order_col, price_col, qty_col]
 
-    # Guardrail: Ensure unique column mappings
     if len(set(mapped_cols)) < 5:
         st.error(
             "⚠️ **Mapping Error:** Please select 5 unique columns. Two or more dropdowns are set to the same header."
         )
-        return None
+        return None, None, None
 
     clean_df = df[mapped_cols].copy()
     clean_df.columns = [
@@ -67,36 +99,30 @@ def process_dynamic_rfm(
         "Quantity",
     ]
 
-    # Guardrail: Check for missing values
     missing_count = clean_df.isna().sum().sum()
     if missing_count > 0:
         st.error(
-            f"❌ **Data Ingestion Error:** Found {missing_count} missing (NaN) values in mapped columns. "
-            "Please upload a dataset with zero missing values or clean your file before uploading."
+            f"❌ **Data Ingestion Error:** Found {missing_count} missing (NaN) values in mapped columns."
         )
-        return None
+        return None, None, None
 
-    # Parse dates safely
     clean_df["OrderDate"] = pd.to_datetime(clean_df["OrderDate"], errors="coerce")
     if clean_df["OrderDate"].isna().sum() > 0:
         st.error(
             "❌ **Date Formatting Error:** Some values in your Order Date column could not be parsed as dates."
         )
-        return None
+        return None, None, None
 
-    # Calculate Total Sales Amount
     clean_df["SalesAmount"] = clean_df["UnitPrice"] * clean_df["Quantity"]
-
-    # 2. Calculate RFM Metrics
     reference_date = clean_df["OrderDate"].max() + pd.Timedelta(days=1)
 
     rfm = (
         clean_df.groupby("CustomerID")
         .agg(
             {
-                "OrderDate": lambda x: (reference_date - x.max()).days,  # Recency
-                "OrderID": "nunique",  # Frequency
-                "SalesAmount": "sum",  # Monetary
+                "OrderDate": lambda x: (reference_date - x.max()).days,
+                "OrderID": "nunique",
+                "SalesAmount": "sum",
             }
         )
         .reset_index()
@@ -106,37 +132,54 @@ def process_dynamic_rfm(
 
     if rfm.empty:
         st.error("❌ Aggregation failed: No valid records found.")
-        return None
+        return None, None, None
 
-    # 3. Feature Transformation (Log1p -> Dynamic Standard Scaling)
+    # Feature Transformation
     X = rfm[["Recency", "Frequency", "Monetary"]]
-
-    # Log Transformation to handle skewness
     X_log = np.log1p(X)
 
-    # Dynamic Standard Scaling
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_log)
 
-    # 4. Dynamic K-Means Clustering
+    # Optimization calculations (Elbow & Silhouette)
+    df_elbow, df_silhouette = calculate_optimization_metrics(X_scaled, max_k=8)
+
+    # Dynamic K-Means Fitting
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     rfm["Cluster"] = kmeans.fit_predict(X_scaled)
 
-    # 5. Relative Persona Mapping (Ranks clusters by average Monetary spend)
+    # Flexible Persona Mapping based on monetary rank
     monetary_rank = (
         rfm.groupby("Cluster")["Monetary"].mean().sort_values().index.tolist()
     )
 
-    persona_map = {
-        monetary_rank[0]: "Lost / Very Lapsed Customers",
-        monetary_rank[1]: "Hibernating / Slipping Customers",
-        monetary_rank[2]: "Warm Leads / Potential Churners",
-        monetary_rank[3]: "Champions / High-Value Loyal Customers",
-    }
+    if n_clusters == 4:
+        persona_names = [
+            "Lost / Very Lapsed Customers",
+            "Hibernating / Slipping Customers",
+            "Warm Leads / Potential Churners",
+            "Champions / High-Value Loyal Customers",
+        ]
+    elif n_clusters == 3:
+        persona_names = [
+            "Lost / Low-Value Customers",
+            "Mid-Tier / Warm Leads",
+            "Champions / High-Value Loyal Customers",
+        ]
+    elif n_clusters == 2:
+        persona_names = ["Low-Value / Inactive", "High-Value / Active"]
+    else:
+        persona_names = [
+            f"Segment Tier {i+1} (Avg Spend: Low-to-High)"
+            for i in range(n_clusters)
+        ]
 
+    persona_map = {
+        monetary_rank[i]: persona_names[i] for i in range(n_clusters)
+    }
     rfm["Customer Segment"] = rfm["Cluster"].map(persona_map)
 
-    return rfm
+    return rfm, df_elbow, df_silhouette
 
 
 # --- FRONTEND UI ---
@@ -148,22 +191,26 @@ st.markdown(
 st.divider()
 
 # --- USER GUIDELINES CARD ---
-with st.expander("📋 **Dataset Requirements & Preparation Instructions (Click to Expand)**", expanded=True):
+with st.expander(
+    "📋 **Dataset Requirements & Preparation Instructions (Click to Expand)**",
+    expanded=False,
+):
     st.markdown("""
     To ensure successful analysis, please ensure your uploaded CSV is **pre-cleaned** and structured according to the following guidelines:
     
     * **No Missing Values:** Ensure there are no empty (`NaN` / `null`) cells in your key transaction columns.
-    * **Positive Numeric Values:** `UnitPrice` and `Quantity` must be numeric, positive numbers ($> 0$). Remove currency symbols (e.g., `$`) or commas prior to upload.
-    * **Valid Dates:** Dates should be formatted consistently (e.g., `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`).
-    * **No Cancellations or Returns:** Exclude negative quantity transactions, returned item logs, or refund invoice numbers beforehand.
-    * **Required Information:** Your file must contain columns representing: **Customer ID**, **Order Date**, **Order ID / Invoice Number**, **Unit Price**, and **Quantity**.
+    * **Positive Numeric Values:** `UnitPrice` and `Quantity` must be numeric, positive numbers ($> 0$). Remove currency symbols or commas prior to upload.
+    * **Valid Dates:** Dates should be formatted consistently (e.g., `YYYY-MM-DD`).
+    * **No Cancellations or Returns:** Exclude negative quantity transactions or refund invoice numbers beforehand.
     """)
 
 st.divider()
 
 # Sidebar Setup
-st.sidebar.header("📁 Data Input")
-uploaded_file = st.sidebar.file_uploader("Upload Clean Transaction CSV", type=["csv"])
+st.sidebar.header("📁 Data Input & Model Parameters")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload Clean Transaction CSV", type=["csv"]
+)
 
 st.sidebar.markdown("**OR**")
 if st.sidebar.button("🎲 Load Sample Demo Data"):
@@ -173,6 +220,17 @@ if st.sidebar.button("🎲 Load Sample Demo Data"):
 
 if uploaded_file is not None:
     st.session_state["raw_df"] = pd.read_csv(uploaded_file)
+
+# Dynamic K-Slider
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ Model Settings")
+n_clusters = st.sidebar.slider(
+    "Select Number of Clusters (K)",
+    min_value=2,
+    max_value=6,
+    value=4,
+    help="Adjust K to segment customers into more or fewer behavioral tiers.",
+)
 
 # Main App Execution
 if "raw_df" in st.session_state:
@@ -214,153 +272,158 @@ if "raw_df" in st.session_state:
             index=find_default(["qty", "quantity", "count"], columns),
         )
 
-    # Data Preview & Quality Summary
-    st.divider()
-    st.subheader("🔍 Dataset Overview & Health Check")
-
-    tab1, tab2 = st.tabs(["Raw Data Preview", "Data Summary"])
-
-    with tab1:
-        st.dataframe(raw_df.head(10), use_container_width=True)
-
-    with tab2:
-        m1, m2, m3 = st.columns(3)
-        total_rows = len(raw_df)
-        total_missing = raw_df[[id_col, date_col, order_col, price_col, qty_col]].isna().sum().sum()
-
-        m1.metric("Total Rows", f"{total_rows:,}")
-        m2.metric("Total Columns", f"{len(columns):,}")
-        m3.metric("Missing Cells (Mapped Fields)", f"{total_missing:,}")
-
-        mapped_fields = {
-            "Customer ID": id_col,
-            "Order Date": date_col,
-            "Order ID": order_col,
-            "Unit Price": price_col,
-            "Quantity": qty_col,
-        }
-
-        health_data = []
-        for field_label, col_name in mapped_fields.items():
-            missing_count = raw_df[col_name].isna().sum()
-            health_data.append({
-                "Mapped Field": field_label,
-                "CSV Column Name": col_name,
-                "Data Type": str(raw_df[col_name].dtype),
-                "Missing Values": missing_count,
-            })
-
-        st.dataframe(pd.DataFrame(health_data), use_container_width=True)
-
     st.divider()
 
     if st.button("🚀 Process & Segment Data", type="primary"):
-        with st.spinner("Training dynamic K-Means model & generating clusters..."):
-            rfm_results = process_dynamic_rfm(
-                raw_df, id_col, date_col, order_col, price_col, qty_col
+        with st.spinner("Calculating metrics, evaluating K, and fitting model..."):
+            rfm_results, df_elbow, df_silhouette = process_dynamic_rfm(
+                raw_df,
+                id_col,
+                date_col,
+                order_col,
+                price_col,
+                qty_col,
+                n_clusters=n_clusters,
             )
             st.session_state["rfm_results"] = rfm_results
+            st.session_state["df_elbow"] = df_elbow
+            st.session_state["df_silhouette"] = df_silhouette
 
-# Display Results & Dashboards
+# Display Results & Analytics Dashboards
 if "rfm_results" in st.session_state and st.session_state["rfm_results"] is not None:
     rfm_df = st.session_state["rfm_results"]
+    df_elbow = st.session_state["df_elbow"]
+    df_silhouette = st.session_state["df_silhouette"]
 
     if not rfm_df.empty:
         st.divider()
-        st.subheader("📌 Key Business Insights")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Customers", f"{len(rfm_df):,}")
-        c2.metric("Avg Recency (Days)", f"{rfm_df['Recency'].mean():.1f}")
-        c3.metric("Avg Frequency (Orders)", f"{rfm_df['Frequency'].mean():.1f}")
-        c4.metric("Avg Spend ($)", f"${rfm_df['Monetary'].mean():,.2f}")
 
-        st.divider()
-
-        # Visualizations
-        st.subheader("Customer Segment Distribution")
-        fig_pie = px.pie(
-            rfm_df,
-            names="Customer Segment",
-            hole=0.4,
-            color_discrete_sequence=px.colors.qualitative.Set2,
+        # Section Tabs
+        main_tab, opt_tab = st.tabs(
+            ["📊 Segmentation Dashboards", "📐 Cluster Optimization (Elbow & Silhouette)"]
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
 
-        st.divider()
+        # TAB 1: SEGMENTATION RESULTS
+        with main_tab:
+            st.subheader("📌 Key Business Insights")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Customers", f"{len(rfm_df):,}")
+            c2.metric("Avg Recency (Days)", f"{rfm_df['Recency'].mean():.1f}")
+            c3.metric(
+                "Avg Frequency (Orders)", f"{rfm_df['Frequency'].mean():.1f}"
+            )
+            c4.metric("Avg Spend ($)", f"${rfm_df['Monetary'].mean():,.2f}")
 
-        st.subheader("Frequency vs Spend (Log Scale)")
-        fig_scatter = px.scatter(
-            rfm_df,
-            x="Frequency",
-            y="Monetary",
-            color="Customer Segment",
-            size="Recency",
-            hover_data=["CustomerID"],
-            log_x=True,
-            log_y=True,
-            color_discrete_sequence=px.colors.qualitative.Set2,
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
+            st.divider()
 
-        # Marketing Strategies Section
-        st.divider()
-        st.subheader("Recommended Marketing Strategies")
+            col_pie, col_scatter = st.columns(2)
 
-        strat_col1, strat_col2 = st.columns(2)
+            with col_pie:
+                st.subheader("Customer Segment Distribution")
+                fig_pie = px.pie(
+                    rfm_df,
+                    names="Customer Segment",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
 
-        with strat_col1:
-            with st.expander("🏆 **Champions / High-Value Loyal Customers**"):
-                st.markdown("""
-                * **Reward Loyalty:** Offer exclusive discounts, early access to new products, or VIP loyalty programs.
-                * **Encourage Referrals:** Ask them to refer friends and family with referral bonuses.
-                * **Personalized Communication:** Send highly relevant product recommendations and updates.
-                """)
+            with col_scatter:
+                st.subheader("Frequency vs Spend (Log Scale)")
+                fig_scatter = px.scatter(
+                    rfm_df,
+                    x="Frequency",
+                    y="Monetary",
+                    color="Customer Segment",
+                    size="Recency",
+                    hover_data=["CustomerID"],
+                    log_x=True,
+                    log_y=True,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
-            with st.expander("⏳ **Hibernating / Slipping Customers**"):
-                st.markdown("""
-                * **Win-Back Campaigns:** Offer incentives to reactivate, such as significant discounts or free shipping.
-                * **Personalized Outreach:** Reach out with personalized messages based on their past purchase history.
-                * **Customer Surveys:** Understand reasons for reduced activity to tailor future strategies.
-                """)
+            st.divider()
+            st.subheader("Segmented Customer Table")
+            st.dataframe(
+                rfm_df[
+                    [
+                        "CustomerID",
+                        "Customer Segment",
+                        "Recency",
+                        "Frequency",
+                        "Monetary",
+                    ]
+                ],
+                use_container_width=True,
+            )
 
-        with strat_col2:
-            with st.expander("🔥 **Warm Leads / Potential Churners**"):
-                st.markdown("""
-                * **Re-engagement Campaigns:** Send targeted emails with special offers or new product announcements to encourage repeat purchases.
-                * **Value Proposition Reminders:** Highlight benefits of past purchases or new features.
-                * **Feedback Collection:** Ask for feedback to understand potential barriers to purchase.
-                """)
+            csv_data = rfm_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download Segmented Results (CSV)",
+                data=csv_data,
+                file_name="rfm_segmented_customers.csv",
+                mime="text/csv",
+            )
 
-            with st.expander("💤 **Lost / Very Lapsed Customers**"):
-                st.markdown("""
-                * **Last-Ditch Offers:** Present aggressive, limited-time offers to entice a return (e.g., steep discounts, significant freebies).
-                * **Focus on Brand Awareness:** If win-back fails, focus on subtle brand reminders without high investment.
-                * **Consider Re-acquisition:** For some, treat as new customers if they haven't responded to win-back efforts.
-                """)
+        # TAB 2: CLUSTER OPTIMIZATION (ELBOW + SILHOUETTE)
+        with opt_tab:
+            st.subheader("Determine Optimal Number of Clusters")
+            st.markdown(
+                "Use these diagnostic charts to select the mathematically optimal value for $K$."
+            )
 
-        # Data Export Table
-        st.divider()
-        st.subheader("Segmented Customer Results")
-        st.dataframe(
-            rfm_df[
-                [
-                    "CustomerID",
-                    "Customer Segment",
-                    "Recency",
-                    "Frequency",
-                    "Monetary",
+            opt_col1, opt_col2 = st.columns(2)
+
+            with opt_col1:
+                st.markdown("### 1. Elbow Method (WCSS)")
+                fig_elbow = px.line(
+                    df_elbow,
+                    x="Number of Clusters (K)",
+                    y="WCSS",
+                    markers=True,
+                    title="Elbow Curve (Within-Cluster Sum of Squares)",
+                )
+                fig_elbow.add_vline(
+                    x=n_clusters,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text=f"Selected K={n_clusters}",
+                )
+                st.plotly_chart(fig_elbow, use_container_width=True)
+                st.info(
+                    "💡 **How to read:** Look for the 'bend' or elbow point where WCSS drops off significantly less."
+                )
+
+            with opt_col2:
+                st.markdown("### 2. Silhouette Analysis")
+                fig_sil = px.bar(
+                    df_silhouette,
+                    x="Number of Clusters (K)",
+                    y="Silhouette Score",
+                    title="Average Silhouette Score by K",
+                    color="Silhouette Score",
+                    color_continuous_scale="Blues",
+                )
+                fig_sil.add_vline(
+                    x=n_clusters,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text=f"Selected K={n_clusters}",
+                )
+                st.plotly_chart(fig_sil, use_container_width=True)
+
+                best_k = df_silhouette.loc[
+                    df_silhouette["Silhouette Score"].idxmax(),
+                    "Number of Clusters (K)",
                 ]
-            ],
-            use_container_width=True,
-        )
+                best_score = df_silhouette["Silhouette Score"].max()
 
-        csv_data = rfm_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download Segmented Results (CSV)",
-            data=csv_data,
-            file_name="rfm_segmented_customers.csv",
-            mime="text/csv",
-        )
+                st.success(
+                    f"🏆 **Highest Silhouette Score:** $K = {int(best_k)}$ (Score: {best_score:.3f}). "
+                    f"This indicates the cleanest cluster separation for this dataset."
+                )
+
 else:
     if "raw_df" not in st.session_state:
         st.info(
