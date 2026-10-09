@@ -1,441 +1,753 @@
-import numpy as np
-import pandas as pd
-import plotly.express as px
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
-import streamlit as st
-
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Universal RFM Customer Segmentation Engine",
-    layout="wide",
-)
-
-
-# --- HELPER FUNCTION FOR SYNTHETIC DEMO DATA GENERATION ---
-def generate_synthetic_data(num_rows=1000, num_customers=150):
-    """Generates a clean preprocessed transaction dataset for demonstration."""
-    np.random.seed(42)
-
-    customer_ids = [f"CUST-{1000 + i}" for i in range(num_customers)]
-    order_ids = [f"INV-{50000 + i}" for i in range(300)]
-    dates = pd.date_range(end="2026-06-30", periods=365, freq="D")
-
-    data = {
-        "CustomerID": np.random.choice(customer_ids, num_rows),
-        "OrderDate": np.random.choice(dates, num_rows),
-        "OrderID": np.random.choice(order_ids, num_rows),
-        "UnitPrice": np.round(
-            np.random.exponential(scale=25.0, size=num_rows) + 1.5, 2
-        ),
-        "Quantity": np.random.randint(1, 12, size=num_rows),
-    }
-
-    return pd.DataFrame(data)
-
-
-# --- HELPER FUNCTION FOR SMART COLUMN MATCHING ---
-def find_default(candidates, cols):
-    """Finds the index of the first matching column name based on keyword candidates."""
-    for c in cols:
-        if any(cand in c.lower() for cand in candidates):
-            return cols.index(c)
-    return 0
-
-
-# --- MODEL OPTIMIZATION CALCULATIONS (ELBOW & SILHOUETTE) ---
-def calculate_optimization_metrics(X_scaled, max_k=8):
-    """Computes WCSS (Inertia) and Silhouette Scores for K=2 to max_k."""
-    wcss = []
-    silhouette_scores = []
-    k_range = list(range(2, max_k + 1))
-
-    # K=1 WCSS calculation
-    km1 = KMeans(n_clusters=1, random_state=42, n_init=10)
-    km1.fit(X_scaled)
-    wcss_all = [km1.inertia_]
-
-    for k in k_range:
-        km = KMeans(n_clusters=k, random_state=42, n_init=10)
-        labels = km.fit_predict(X_scaled)
-        wcss_all.append(km.inertia_)
-        score = silhouette_score(X_scaled, labels)
-        silhouette_scores.append(score)
-
-    df_elbow = pd.DataFrame(
-        {"Number of Clusters (K)": list(range(1, max_k + 1)), "WCSS": wcss_all}
-    )
-
-    df_silhouette = pd.DataFrame(
-        {
-            "Number of Clusters (K)": k_range,
-            "Silhouette Score": silhouette_scores,
-        }
-    )
-
-    return df_elbow, df_silhouette
-
-
-# --- DYNAMIC RFM & K-MEANS PIPELINE ---
-def process_dynamic_rfm(
-    df, id_col, date_col, order_col, price_col, qty_col, n_clusters=4
-):
-    """Aggregates RFM metrics, log-transforms, scales, and fits K-Means dynamically."""
-    mapped_cols = [id_col, date_col, order_col, price_col, qty_col]
-
-    if len(set(mapped_cols)) < 5:
-        st.error(
-            "⚠️ **Mapping Error:** Please select 5 unique columns. Two or more dropdowns are set to the same header."
-        )
-        return None, None, None
-
-    clean_df = df[mapped_cols].copy()
-    clean_df.columns = [
-        "CustomerID",
-        "OrderDate",
-        "OrderID",
-        "UnitPrice",
-        "Quantity",
-    ]
-
-    missing_count = clean_df.isna().sum().sum()
-    if missing_count > 0:
-        st.error(
-            f"❌ **Data Ingestion Error:** Found {missing_count} missing (NaN) values in mapped columns."
-        )
-        return None, None, None
-
-    clean_df["OrderDate"] = pd.to_datetime(clean_df["OrderDate"], errors="coerce")
-    if clean_df["OrderDate"].isna().sum() > 0:
-        st.error(
-            "❌ **Date Formatting Error:** Some values in your Order Date column could not be parsed as dates."
-        )
-        return None, None, None
-
-    clean_df["SalesAmount"] = clean_df["UnitPrice"] * clean_df["Quantity"]
-    reference_date = clean_df["OrderDate"].max() + pd.Timedelta(days=1)
-
-    rfm = (
-        clean_df.groupby("CustomerID")
-        .agg(
-            {
-                "OrderDate": lambda x: (reference_date - x.max()).days,
-                "OrderID": "nunique",
-                "SalesAmount": "sum",
-            }
-        )
-        .reset_index()
-    )
-
-    rfm.columns = ["CustomerID", "Recency", "Frequency", "Monetary"]
-
-    if rfm.empty:
-        st.error("❌ Aggregation failed: No valid records found.")
-        return None, None, None
-
-    # Feature Transformation
-    X = rfm[["Recency", "Frequency", "Monetary"]]
-    X_log = np.log1p(X)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_log)
-
-    # Optimization calculations (Elbow & Silhouette)
-    df_elbow, df_silhouette = calculate_optimization_metrics(X_scaled, max_k=8)
-
-    # Dynamic K-Means Fitting
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    rfm["Cluster"] = kmeans.fit_predict(X_scaled)
-
-    # Flexible Persona Mapping based on monetary rank
-    monetary_rank = (
-        rfm.groupby("Cluster")["Monetary"].mean().sort_values().index.tolist()
-    )
-
-    if n_clusters == 4:
-        persona_names = [
-            "Lost / Very Lapsed Customers",
-            "Hibernating / Slipping Customers",
-            "Warm Leads / Potential Churners",
-            "Champions / High-Value Loyal Customers",
-        ]
-    elif n_clusters == 3:
-        persona_names = [
-            "Lost / Low-Value Customers",
-            "Mid-Tier / Warm Leads",
-            "Champions / High-Value Loyal Customers",
-        ]
-    elif n_clusters == 2:
-        persona_names = ["Low-Value / Inactive", "High-Value / Active"]
-    else:
-        persona_names = [
-            f"Segment Tier {i+1} (Avg Spend: Low-to-High)"
-            for i in range(n_clusters)
-        ]
-
-    persona_map = {
-        monetary_rank[i]: persona_names[i] for i in range(n_clusters)
-    }
-    rfm["Customer Segment"] = rfm["Cluster"].map(persona_map)
-
-    return rfm, df_elbow, df_silhouette
-
-
-# --- FRONTEND UI ---
-st.title("Universal RFM Customer Segmentation Engine")
-st.markdown(
-    "A dynamic machine learning dashboard that fits a K-Means model on the fly for any uploaded e-commerce dataset."
-)
-
-st.divider()
-
-# --- USER GUIDELINES CARD ---
-with st.expander(
-    "📋 **Dataset Requirements & Preparation Instructions (Click to Expand)**",
-    expanded=False,
-):
-    st.markdown("""
-    To ensure successful analysis, please ensure your uploaded CSV is **pre-cleaned** and structured according to the following guidelines:
-    
-    * **No Missing Values:** Ensure there are no empty (`NaN` / `null`) cells in your key transaction columns.
-    * **Positive Numeric Values:** `UnitPrice` and `Quantity` must be numeric, positive numbers ($> 0$). Remove currency symbols or commas prior to upload.
-    * **Valid Dates:** Dates should be formatted consistently (e.g., `YYYY-MM-DD`).
-    * **No Cancellations or Returns:** Exclude negative quantity transactions or refund invoice numbers beforehand.
-    """)
-
-st.divider()
-
-# Sidebar Setup
-st.sidebar.header("📁 Data Input & Model Parameters")
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Clean Transaction CSV", type=["csv"]
-)
-
-st.sidebar.markdown("**OR**")
-if st.sidebar.button("🎲 Load Sample Demo Data"):
-    st.session_state["raw_df"] = generate_synthetic_data()
-    st.session_state.pop("rfm_results", None)
-    st.sidebar.success("Loaded 1,000 clean synthetic transactions!")
-
-if uploaded_file is not None:
-    st.session_state["raw_df"] = pd.read_csv(uploaded_file)
-
-# Dynamic K-Slider
-st.sidebar.divider()
-st.sidebar.subheader("⚙️ Model Settings")
-n_clusters = st.sidebar.slider(
-    "Select Number of Clusters (K)",
-    min_value=2,
-    max_value=6,
-    value=4,
-    help="Adjust K to segment customers into more or fewer behavioral tiers.",
-)
-
-# Main App Execution
-if "raw_df" in st.session_state:
-    raw_df = st.session_state["raw_df"]
-    columns = list(raw_df.columns)
-
-    # Column Mapping Section
-    st.subheader("Map Your Data Columns")
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    with col1:
-        id_col = st.selectbox(
-            "Customer ID",
-            columns,
-            index=find_default(["cust", "user", "client"], columns),
-        )
-    with col2:
-        date_col = st.selectbox(
-            "Order Date",
-            columns,
-            index=find_default(["date", "time", "day"], columns),
-        )
-    with col3:
-        order_col = st.selectbox(
-            "Order ID",
-            columns,
-            index=find_default(["order", "txn", "invoice"], columns),
-        )
-    with col4:
-        price_col = st.selectbox(
-            "Unit Price",
-            columns,
-            index=find_default(["price", "rate", "cost"], columns),
-        )
-    with col5:
-        qty_col = st.selectbox(
-            "Quantity",
-            columns,
-            index=find_default(["qty", "quantity", "count"], columns),
-        )
-
-    st.divider()
-
-    if st.button("🚀 Process & Segment Data", type="primary"):
-        with st.spinner("Calculating metrics, evaluating K, and fitting model..."):
-            rfm_results, df_elbow, df_silhouette = process_dynamic_rfm(
-                raw_df,
-                id_col,
-                date_col,
-                order_col,
-                price_col,
-                qty_col,
-                n_clusters=n_clusters,
-            )
-            st.session_state["rfm_results"] = rfm_results
-            st.session_state["df_elbow"] = df_elbow
-            st.session_state["df_silhouette"] = df_silhouette
-
-# Display Results & Analytics Dashboards
-if "rfm_results" in st.session_state and st.session_state["rfm_results"] is not None:
-    rfm_df = st.session_state["rfm_results"]
-    df_elbow = st.session_state["df_elbow"]
-    df_silhouette = st.session_state["df_silhouette"]
-
-    if not rfm_df.empty:
-        st.divider()
-
-        # Section Tabs
-        main_tab, opt_tab = st.tabs(
-            ["📊 Segmentation Dashboards", "📐 Cluster Optimization (Elbow & Silhouette)"]
-        )
-
-        # TAB 1: SEGMENTATION RESULTS
-        with main_tab:
-            st.subheader("📌 Key Business Insights")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Customers", f"{len(rfm_df):,}")
-            c2.metric("Avg Recency (Days)", f"{rfm_df['Recency'].mean():.1f}")
-            c3.metric(
-                "Avg Frequency (Orders)", f"{rfm_df['Frequency'].mean():.1f}"
-            )
-            c4.metric("Avg Spend ($)", f"${rfm_df['Monetary'].mean():,.2f}")
-
-            st.divider()
-
-            col_pie, col_scatter = st.columns(2)
-
-            with col_pie:
-                st.subheader("Customer Segment Distribution")
-                fig_pie = px.pie(
-                    rfm_df,
-                    names="Customer Segment",
-                    hole=0.4,
-                    color_discrete_sequence=px.colors.qualitative.Set2,
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-            with col_scatter:
-                st.subheader("Frequency vs Spend (Log Scale)")
-                fig_scatter = px.scatter(
-                    rfm_df,
-                    x="Frequency",
-                    y="Monetary",
-                    color="Customer Segment",
-                    size="Recency",
-                    hover_data=["CustomerID"],
-                    log_x=True,
-                    log_y=True,
-                    color_discrete_sequence=px.colors.qualitative.Set2,
-                )
-                st.plotly_chart(fig_scatter, use_container_width=True)
-
-            st.divider()
-            st.subheader("Segmented Customer Table")
-            st.dataframe(
-                rfm_df[
-                    [
-                        "CustomerID",
-                        "Customer Segment",
-                        "Recency",
-                        "Frequency",
-                        "Monetary",
-                    ]
-                ],
-                use_container_width=True,
-            )
-
-            csv_data = rfm_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Download Segmented Results (CSV)",
-                data=csv_data,
-                file_name="rfm_segmented_customers.csv",
-                mime="text/csv",
-            )
-
-        # TAB 2: CLUSTER OPTIMIZATION (ELBOW + SILHOUETTE)
-        with opt_tab:
-            st.subheader("Determine Optimal Number of Clusters")
-            st.markdown(
-                "Use these diagnostic charts to select the mathematically optimal value for $K$."
-            )
-
-            opt_col1, opt_col2 = st.columns(2)
-
-            with opt_col1:
-                st.markdown("### 1. Elbow Method (WCSS)")
-                fig_elbow = px.line(
-                    df_elbow,
-                    x="Number of Clusters (K)",
-                    y="WCSS",
-                    markers=True,
-                    title="Elbow Curve (Within-Cluster Sum of Squares)",
-                )
-                fig_elbow.add_vline(
-                    x=n_clusters,
-                    line_dash="dash",
-                    line_color="red",
-                    annotation_text=f"Selected K={n_clusters}",
-                )
-                st.plotly_chart(fig_elbow, use_container_width=True)
-                st.info(
-                    "💡 **How to read:** Look for the 'bend' or elbow point where WCSS drops off significantly less."
-                )
-
-            with opt_col2:
-                st.markdown("### 2. Silhouette Analysis")
-                fig_sil = px.bar(
-                    df_silhouette,
-                    x="Number of Clusters (K)",
-                    y="Silhouette Score",
-                    title="Average Silhouette Score by K",
-                    color="Silhouette Score",
-                    color_continuous_scale="Blues",
-                )
-                fig_sil.add_vline(
-                    x=n_clusters,
-                    line_dash="dash",
-                    line_color="red",
-                    annotation_text=f"Selected K={n_clusters}",
-                )
-                st.plotly_chart(fig_sil, use_container_width=True)
-
-                best_k = df_silhouette.loc[
-                    df_silhouette["Silhouette Score"].idxmax(),
-                    "Number of Clusters (K)",
-                ]
-                best_score = df_silhouette["Silhouette Score"].max()
-
-                st.success(
-                    f"🏆 **Highest Silhouette Score:** $K = {int(best_k)}$ (Score: {best_score:.3f}). "
-                    f"This indicates the cleanest cluster separation for this dataset."
-                )
-
-else:
-    if "raw_df" not in st.session_state:
-        st.info(
-            "👈 Upload a transaction CSV file or click 'Load Sample Demo Data' in the sidebar to get started!"
-        )
-
-# Footer
-st.markdown(
-    """
-    <div style='text-align: center; color: #888888; padding-top: 20px;'>
-        © 2026 • Built with Streamlit & Python by Ranithri Hewasiliyan • All Rights Reserved
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal RFM Customer Segmentation Engine</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Plotly.js CDN -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <!-- PapaParse CDN for CSV Handling -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans min-h-screen flex flex-col">
+
+    <!-- Header / Navbar -->
+    <header class="bg-slate-900 text-white p-6 shadow-md">
+        <div class="max-w-7xl mx-auto flex justify-between items-center">
+            <div>
+                <h1 class="text-2xl font-bold tracking-tight">Universal RFM Customer Segmentation Engine</h1>
+                <p class="text-slate-400 text-sm mt-1">A dynamic client-side machine learning engine executing K-Means on the fly in pure JavaScript.</p>
+            </div>
+        </div>
+    </header>
+
+    <div class="max-w-7xl mx-auto w-full p-6 flex-grow grid grid-cols-1 lg:grid-cols-4 gap-6">
+
+        <!-- Sidebar / Control Panel -->
+        <aside class="lg:col-span-1 bg-white p-5 rounded-xl shadow-sm border border-gray-200 flex flex-col gap-6">
+            <div>
+                <h2 class="text-lg font-semibold border-b pb-2 mb-4 text-slate-800">📁 Data Input</h2>
+                
+                <label class="block text-sm font-medium text-gray-700 mb-2">Upload Clean Transaction CSV</label>
+                <input type="file" id="csvFileInput" accept=".csv" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer border rounded-lg p-1"/>
+                
+                <div class="relative flex py-3 items-center">
+                    <div class="flex-grow border-t border-gray-200"></div>
+                    <span class="flex-shrink mx-2 text-gray-400 text-xs uppercase font-bold">OR</span>
+                    <div class="flex-grow border-t border-gray-200"></div>
+                </div>
+
+                <button id="btnDemoData" class="w-full bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium py-2 px-4 rounded-lg transition duration-150 border border-slate-300 text-sm">
+                    🎲 Load Sample Demo Data
+                </button>
+            </div>
+
+            <div class="border-t pt-4">
+                <h2 class="text-lg font-semibold border-b pb-2 mb-4 text-slate-800">⚙️ Model Settings</h2>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Select Clusters (K): <span id="kValDisplay" class="font-bold text-blue-600">4</span>
+                </label>
+                <input type="range" id="sliderK" min="2" max="6" value="4" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer">
+                <p class="text-xs text-gray-500 mt-2">Adjust K to segment customers into more or fewer behavioral tiers.</p>
+            </div>
+
+            <button id="btnProcess" disabled class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 px-4 rounded-lg transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed text-sm shadow">
+                🚀 Process & Segment Data
+            </button>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="lg:col-span-3 flex flex-col gap-6">
+
+            <!-- Dataset Guidelines Accordion -->
+            <details class="bg-white border border-blue-100 rounded-xl p-4 shadow-sm group">
+                <summary class="font-semibold text-blue-900 cursor-pointer flex justify-between items-center text-sm">
+                    <span>📋 Dataset Requirements & Preparation Instructions</span>
+                    <span class="group-open:rotate-180 transition-transform">▼</span>
+                </summary>
+                <ul class="text-xs text-gray-600 mt-3 space-y-1.5 list-disc list-inside border-t pt-3 border-blue-50">
+                    <li><strong>No Missing Values:</strong> Ensure there are no empty (<code class="bg-gray-100 px-1 py-0.5 rounded">NaN</code> / <code class="bg-gray-100 px-1 py-0.5 rounded">null</code>) cells in key mapped fields.</li>
+                    <li><strong>Positive Numeric Values:</strong> <code class="bg-gray-100 px-1 py-0.5 rounded">UnitPrice</code> and <code class="bg-gray-100 px-1 py-0.5 rounded">Quantity</code> must be positive numbers (> 0) without currency symbols ($).</li>
+                    <li><strong>Valid Dates:</strong> Dates should be formatted consistently (e.g., <code class="bg-gray-100 px-1 py-0.5 rounded">YYYY-MM-DD</code>).</li>
+                    <li><strong>No Cancellations:</strong> Filter out returns, refunds, or negative transaction quantities beforehand.</li>
+                </ul>
+            </details>
+
+            <!-- Column Mapping Section -->
+            <section id="secMapping" class="hidden bg-white p-5 rounded-xl shadow-sm border border-gray-200">
+                <h3 class="text-md font-semibold text-gray-800 mb-3">Map Your Data Columns</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Customer ID</label>
+                        <select id="mapId" class="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white focus:ring-blue-500 focus:border-blue-500"></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Order Date</label>
+                        <select id="mapDate" class="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white focus:ring-blue-500 focus:border-blue-500"></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Order ID</label>
+                        <select id="mapOrder" class="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white focus:ring-blue-500 focus:border-blue-500"></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Unit Price</label>
+                        <select id="mapPrice" class="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white focus:ring-blue-500 focus:border-blue-500"></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Quantity</label>
+                        <select id="mapQty" class="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white focus:ring-blue-500 focus:border-blue-500"></select>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Error Banner -->
+            <div id="alertBox" class="hidden p-4 rounded-xl text-sm font-medium border"></div>
+
+            <!-- Tabbed Interface for Results & Diagnostics -->
+            <div id="secResults" class="hidden flex-col gap-6">
+                <!-- Navigation Tabs -->
+                <div class="border-b border-gray-200 bg-white rounded-t-xl px-4 pt-2">
+                    <nav class="flex gap-6">
+                        <button id="tabBtnDash" class="pb-3 px-1 text-sm font-semibold border-b-2 border-blue-600 text-blue-600">📊 Segmentation Dashboards</button>
+                        <button id="tabBtnOpt" class="pb-3 px-1 text-sm font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-700">📐 Cluster Optimization (Elbow & Silhouette)</button>
+                    </nav>
+                </div>
+
+                <!-- Tab 1: Segmentation Results -->
+                <div id="tabContentDash" class="flex flex-col gap-6">
+                    <!-- Key KPI Metrics -->
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <p class="text-xs text-gray-500 font-medium">Total Customers</p>
+                            <p id="metricTotalCust" class="text-xl font-bold text-gray-800 mt-1">-</p>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <p class="text-xs text-gray-500 font-medium">Avg Recency (Days)</p>
+                            <p id="metricAvgRecency" class="text-xl font-bold text-gray-800 mt-1">-</p>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <p class="text-xs text-gray-500 font-medium">Avg Frequency (Orders)</p>
+                            <p id="metricAvgFreq" class="text-xl font-bold text-gray-800 mt-1">-</p>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <p class="text-xs text-gray-500 font-medium">Avg Spend ($)</p>
+                            <p id="metricAvgSpend" class="text-xl font-bold text-gray-800 mt-1">-</p>
+                        </div>
+                    </div>
+
+                    <!-- Plotly Visualization Charts -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <h4 class="text-sm font-semibold text-gray-700 mb-2">Customer Segment Distribution</h4>
+                            <div id="plotPie" class="w-full h-80"></div>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <h4 class="text-sm font-semibold text-gray-700 mb-2">Frequency vs Spend (Log Scale)</h4>
+                            <div id="plotScatter" class="w-full h-80"></div>
+                        </div>
+                    </div>
+
+                    <!-- Output Data Table -->
+                    <div class="bg-white p-5 rounded-xl border shadow-sm">
+                        <div class="flex justify-between items-center mb-4">
+                            <h4 class="text-sm font-semibold text-gray-700">Segmented Customer Table</h4>
+                            <button id="btnDownload" class="bg-green-600 hover:bg-green-700 text-white text-xs font-semibold py-1.5 px-3 rounded-lg shadow transition">
+                                📥 Download Segmented Results (CSV)
+                            </button>
+                        </div>
+                        <div class="max-h-64 overflow-y-auto border rounded-lg">
+                            <table class="w-full text-left text-xs border-collapse">
+                                <thead class="bg-gray-100 sticky top-0 border-b">
+                                    <tr>
+                                        <th class="p-2.5 font-semibold text-gray-700">Customer ID</th>
+                                        <th class="p-2.5 font-semibold text-gray-700">Customer Segment</th>
+                                        <th class="p-2.5 font-semibold text-gray-700">Recency (Days)</th>
+                                        <th class="p-2.5 font-semibold text-gray-700">Frequency (Orders)</th>
+                                        <th class="p-2.5 font-semibold text-gray-700">Monetary ($)</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tableBody" class="divide-y"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 2: Optimization Diagnostics -->
+                <div id="tabContentOpt" class="hidden flex-col gap-6">
+                    <div class="bg-white p-4 rounded-xl border shadow-sm">
+                        <h3 class="text-md font-semibold text-gray-800">Determine Optimal Number of Clusters</h3>
+                        <p class="text-xs text-gray-500 mt-1">Use these diagnostic charts to evaluate the mathematical structure of your dataset.</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <h4 class="text-sm font-semibold text-gray-700 mb-2">1. Elbow Method (WCSS)</h4>
+                            <div id="plotElbow" class="w-full h-72"></div>
+                            <div class="bg-blue-50 p-3 rounded-lg text-xs text-blue-800 border border-blue-100 mt-2">
+                                💡 <strong>How to read:</strong> Look for the "bend" or elbow point where WCSS drops off significantly less.
+                            </div>
+                        </div>
+                        <div class="bg-white p-4 rounded-xl border shadow-sm">
+                            <h4 class="text-sm font-semibold text-gray-700 mb-2">2. Silhouette Analysis</h4>
+                            <div id="plotSilhouette" class="w-full h-72"></div>
+                            <div id="silhouetteWinnerBox" class="bg-green-50 p-3 rounded-lg text-xs text-green-800 border border-green-200 mt-2"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
     </div>
-    """,
-    unsafe_allow_html=True,
-)
+
+    <!-- Footer -->
+    <footer class="bg-white border-t p-4 text-center text-xs text-gray-500 mt-auto">
+        © 2026 • Built with Pure JS, Plotly & Tailwind • All Rights Reserved
+    </footer>
+
+    <!-- CLIENT-SIDE APPLICATION LOGIC -->
+    <script>
+        // --- GLOBAL STATE ---
+        let rawDataset = null;
+        let processedRfmResults = null;
+
+        // --- DOM ELEMENTS ---
+        const csvFileInput = document.getElementById('csvFileInput');
+        const btnDemoData = document.getElementById('btnDemoData');
+        const sliderK = document.getElementById('sliderK');
+        const kValDisplay = document.getElementById('kValDisplay');
+        const btnProcess = document.getElementById('btnProcess');
+        const secMapping = document.getElementById('secMapping');
+        const secResults = document.getElementById('secResults');
+        const alertBox = document.getElementById('alertBox');
+
+        const mapId = document.getElementById('mapId');
+        const mapDate = document.getElementById('mapDate');
+        const mapOrder = document.getElementById('mapOrder');
+        const mapPrice = document.getElementById('mapPrice');
+        const mapQty = document.getElementById('mapQty');
+
+        // --- EVENT LISTENERS ---
+        sliderK.addEventListener('input', (e) => kValDisplay.textContent = e.target.value);
+
+        btnDemoData.addEventListener('click', () => {
+            rawDataset = generateSyntheticData(1000, 150);
+            populateMappingDropdowns();
+            btnProcess.disabled = false;
+            hideAlert();
+        });
+
+        csvFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            Papa.parse(file, {
+                header: true,
+                skipEmptyLines: true,
+                complete: (results) => {
+                    if (results.data && results.data.length > 0) {
+                        rawDataset = results.data;
+                        populateMappingDropdowns();
+                        btnProcess.disabled = false;
+                        hideAlert();
+                    } else {
+                        showAlert("❌ Could not parse any valid records from the uploaded CSV.", "red");
+                    }
+                },
+                error: (err) => showAlert(`❌ CSV Parse Error: ${err.message}`, "red")
+            });
+        });
+
+        btnProcess.addEventListener('click', () => runPipeline());
+
+        // Tab Switching Logic
+        const tabBtnDash = document.getElementById('tabBtnDash');
+        const tabBtnOpt = document.getElementById('tabBtnOpt');
+        const tabContentDash = document.getElementById('tabContentDash');
+        const tabContentOpt = document.getElementById('tabContentOpt');
+
+        tabBtnDash.addEventListener('click', () => {
+            tabBtnDash.className = "pb-3 px-1 text-sm font-semibold border-b-2 border-blue-600 text-blue-600";
+            tabBtnOpt.className = "pb-3 px-1 text-sm font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-700";
+            tabContentDash.classList.remove('hidden');
+            tabContentDash.classList.add('flex');
+            tabContentOpt.classList.add('hidden');
+            tabContentOpt.classList.remove('flex');
+        });
+
+        tabBtnOpt.addEventListener('click', () => {
+            tabBtnOpt.className = "pb-3 px-1 text-sm font-semibold border-b-2 border-blue-600 text-blue-600";
+            tabBtnDash.className = "pb-3 px-1 text-sm font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-700";
+            tabContentOpt.classList.remove('hidden');
+            tabContentOpt.classList.add('flex');
+            tabContentDash.classList.add('hidden');
+            tabContentDash.classList.remove('flex');
+            Plotly.Plots.resize('plotElbow');
+            Plotly.Plots.resize('plotSilhouette');
+        });
+
+        document.getElementById('btnDownload').addEventListener('click', () => downloadCSV());
+
+        // --- HELPER FUNCTIONS ---
+        function showAlert(msg, color = "red") {
+            alertBox.className = `p-4 rounded-xl text-sm font-medium border bg-${color}-50 text-${color}-800 border-${color}-200 block`;
+            alertBox.innerHTML = msg;
+        }
+
+        function hideAlert() {
+            alertBox.className = "hidden";
+        }
+
+        function findDefaultCol(candidates, columns) {
+            for (let col of columns) {
+                if (candidates.some(cand => col.toLowerCase().includes(cand))) {
+                    return col;
+                }
+            }
+            return columns[0] || '';
+        }
+
+        function populateMappingDropdowns() {
+            if (!rawDataset || rawDataset.length === 0) return;
+            const cols = Object.keys(rawDataset[0]);
+
+            const dropdowns = [
+                { el: mapId, cand: ["cust", "user", "client"] },
+                { el: mapDate, cand: ["date", "time", "day"] },
+                { el: mapOrder, cand: ["order", "txn", "invoice"] },
+                { el: mapPrice, cand: ["price", "rate", "cost"] },
+                { el: mapQty, cand: ["qty", "quantity", "count"] }
+            ];
+
+            dropdowns.forEach(({ el, cand }) => {
+                el.innerHTML = '';
+                cols.forEach(col => {
+                    const opt = document.createElement('option');
+                    opt.value = col;
+                    opt.textContent = col;
+                    el.appendChild(opt);
+                });
+                el.value = findDefaultCol(cand, cols);
+            });
+
+            secMapping.classList.remove('hidden');
+        }
+
+        // --- SYNTHETIC DATA GENERATOR ---
+        function generateSyntheticData(numRows = 1000, numCust = 150) {
+            const custIds = Array.from({ length: numCust }, (_, i) => `CUST-${1000 + i}`);
+            const orderIds = Array.from({ length: 300 }, (_, i) => `INV-${50000 + i}`);
+            const rows = [];
+            
+            const baseTime = new Date('2026-06-30T00:00:00').getTime();
+
+            for (let i = 0; i < numRows; i++) {
+                const randomDays = Math.floor(Math.random() * 365);
+                const orderDate = new Date(baseTime - randomDays * 86400000).toISOString().split('T')[0];
+                const unitPrice = (Math.exp(Math.random() * 3) + 1.5).toFixed(2);
+                const qty = Math.floor(Math.random() * 11) + 1;
+
+                rows.push({
+                    CustomerID: custIds[Math.floor(Math.random() * custIds.length)],
+                    OrderDate: orderDate,
+                    OrderID: orderIds[Math.floor(Math.random() * orderIds.length)],
+                    UnitPrice: parseFloat(unitPrice),
+                    Quantity: qty
+                });
+            }
+            return rows;
+        }
+
+        // --- CORE RFM & K-MEANS ALGORITHMS ---
+        function runPipeline() {
+            hideAlert();
+
+            const idCol = mapId.value;
+            const dateCol = mapDate.value;
+            const orderCol = mapOrder.value;
+            const priceCol = mapPrice.value;
+            const qtyCol = mapQty.value;
+
+            const selectedCols = [idCol, dateCol, orderCol, priceCol, qtyCol];
+            if (new Set(selectedCols).size < 5) {
+                showAlert("⚠️ <strong>Mapping Error:</strong> Please select 5 unique columns. Two or more dropdowns point to the same header.");
+                return;
+            }
+
+            // 1. Data Ingestion & Cleaning
+            const cleanRows = [];
+            for (let row of rawDataset) {
+                const cId = String(row[idCol] || '').trim();
+                const dVal = new Date(row[dateCol]);
+                const oId = String(row[orderCol] || '').trim();
+                const price = parseFloat(row[priceCol]);
+                const qty = parseFloat(row[qtyCol]);
+
+                if (!cId || isNaN(dVal.getTime()) || !oId || isNaN(price) || isNaN(qty)) {
+                    showAlert(`❌ <strong>Data Ingestion Error:</strong> Missing or malformed values detected in mapped columns.`, "red");
+                    return;
+                }
+
+                cleanRows.push({
+                    CustomerID: cId,
+                    OrderDate: dVal,
+                    OrderID: oId,
+                    UnitPrice: price,
+                    Quantity: qty,
+                    SalesAmount: price * qty
+                });
+            }
+
+            // 2. Aggregate RFM Metrics
+            let maxTime = 0;
+            cleanRows.forEach(r => { if (r.OrderDate.getTime() > maxTime) maxTime = r.OrderDate.getTime(); });
+            const refDate = maxTime + 86400000;
+
+            const customerMap = {};
+            cleanRows.forEach(r => {
+                if (!customerMap[r.CustomerID]) {
+                    customerMap[r.CustomerID] = { CustomerID: r.CustomerID, maxDate: r.OrderDate.getTime(), orders: new Set(), sales: 0 };
+                }
+                const c = customerMap[r.CustomerID];
+                if (r.OrderDate.getTime() > c.maxDate) c.maxDate = r.OrderDate.getTime();
+                c.orders.add(r.OrderID);
+                c.sales += r.SalesAmount;
+            });
+
+            const rfmList = Object.values(customerMap).map(c => ({
+                CustomerID: c.CustomerID,
+                Recency: Math.round((refDate - c.maxDate) / 86400000),
+                Frequency: c.orders.size,
+                Monetary: c.sales
+            }));
+
+            // 3. Log1p Transformation & Standardization
+            const featureMatrix = rfmList.map(r => [
+                Math.log1p(r.Recency),
+                Math.log1p(r.Frequency),
+                Math.log1p(r.Monetary)
+            ]);
+
+            const means = [0, 0, 0];
+            const stds = [0, 0, 0];
+            const n = featureMatrix.length;
+
+            for (let i = 0; i < 3; i++) {
+                means[i] = featureMatrix.reduce((sum, row) => sum + row[i], 0) / n;
+                const variance = featureMatrix.reduce((sum, row) => sum + Math.pow(row[i] - means[i], 2), 0) / n;
+                stds[i] = Math.sqrt(variance) || 1e-8;
+            }
+
+            const scaledMatrix = featureMatrix.map(row => row.map((val, j) => (val - means[j]) / stds[j]));
+
+            // 4. Compute Optimization Metrics (Elbow & Silhouette)
+            const kSelected = parseInt(sliderK.value);
+            const maxK = 8;
+            const elbowData = [];
+            const silhouetteData = [];
+
+            for (let k = 1; k <= maxK; k++) {
+                const res = runKMeans(scaledMatrix, k);
+                elbowData.push({ k, wcss: res.wcss });
+                if (k >= 2) {
+                    const silScore = calculateSilhouetteScore(scaledMatrix, res.assignments, res.centroids);
+                    silhouetteData.push({ k, score: silScore });
+                }
+            }
+
+            // 5. Fit KMeans for Selected K
+            const finalKMeans = runKMeans(scaledMatrix, kSelected);
+            rfmList.forEach((r, idx) => r.Cluster = finalKMeans.assignments[idx]);
+
+            // 6. Dynamic Persona Mapping based on Monetary rank
+            const clusterMonetarySums = Array(kSelected).fill(0);
+            const clusterCounts = Array(kSelected).fill(0);
+
+            rfmList.forEach(r => {
+                clusterMonetarySums[r.Cluster] += r.Monetary;
+                clusterCounts[r.Cluster]++;
+            });
+
+            const clusterMeans = clusterMonetarySums.map((sum, cIdx) => ({
+                cluster: cIdx,
+                avgMonetary: sum / (clusterCounts[cIdx] || 1)
+            })).sort((a, b) => a.avgMonetary - b.avgMonetary);
+
+            let personaLabels = [];
+            if (kSelected === 4) {
+                personaLabels = [
+                    "Lost / Very Lapsed Customers",
+                    "Hibernating / Slipping Customers",
+                    "Warm Leads / Potential Churners",
+                    "Champions / High-Value Loyal Customers"
+                ];
+            } else if (kSelected === 3) {
+                personaLabels = [
+                    "Lost / Low-Value Customers",
+                    "Mid-Tier / Warm Leads",
+                    "Champions / High-Value Loyal Customers"
+                ];
+            } else if (kSelected === 2) {
+                personaLabels = ["Low-Value / Inactive", "High-Value / Active"];
+            } else {
+                personaLabels = Array.from({ length: kSelected }, (_, i) => `Segment Tier ${i + 1} (Avg Spend: Low-to-High)`);
+            }
+
+            const personaMap = {};
+            clusterMeans.forEach((item, rank) => {
+                personaMap[item.cluster] = personaLabels[rank];
+            });
+
+            rfmList.forEach(r => r.Segment = personaMap[r.Cluster]);
+
+            processedRfmResults = rfmList;
+
+            // 7. Render Frontend Dashboards
+            renderDashboards(rfmList, elbowData, silhouetteData, kSelected);
+            secResults.classList.remove('hidden');
+            secResults.classList.add('flex');
+        }
+
+        // --- K-MEANS ENGINE IMPLEMENTATION ---
+        function runKMeans(X, k, maxIter = 100) {
+            const numSamples = X.length;
+            const numFeatures = X[0].length;
+
+            // Deterministic centroid initialization
+            let centroids = [];
+            for (let i = 0; i < k; i++) {
+                const idx = Math.floor((i * numSamples) / k);
+                centroids.push([...X[idx]]);
+            }
+
+            let assignments = new Array(numSamples).fill(0);
+            let wcss = 0;
+
+            for (let iter = 0; iter < maxIter; iter++) {
+                let changed = false;
+                wcss = 0;
+
+                for (let i = 0; i < numSamples; i++) {
+                    let minDist = Infinity;
+                    let bestCluster = 0;
+
+                    for (let c = 0; c < k; c++) {
+                        let dist = 0;
+                        for (let j = 0; j < numFeatures; j++) {
+                            dist += Math.pow(X[i][j] - centroids[c][j], 2);
+                        }
+                        if (dist < minDist) {
+                            minDist = dist;
+                            bestCluster = c;
+                        }
+                    }
+
+                    wcss += minDist;
+                    if (assignments[i] !== bestCluster) {
+                        assignments[i] = bestCluster;
+                        changed = true;
+                    }
+                }
+
+                if (!changed && iter > 0) break;
+
+                const newCentroids = Array.from({ length: k }, () => new Array(numFeatures).fill(0));
+                const counts = new Array(k).fill(0);
+
+                for (let i = 0; i < numSamples; i++) {
+                    const c = assignments[i];
+                    counts[c]++;
+                    for (let j = 0; j < numFeatures; j++) {
+                        newCentroids[c][j] += X[i][j];
+                    }
+                }
+
+                for (let c = 0; c < k; c++) {
+                    if (counts[c] > 0) {
+                        for (let j = 0; j < numFeatures; j++) {
+                            newCentroids[c][j] /= counts[c];
+                        }
+                    } else {
+                        newCentroids[c] = [...X[Math.floor(Math.random() * numSamples)]];
+                    }
+                }
+                centroids = newCentroids;
+            }
+
+            return { centroids, assignments, wcss };
+        }
+
+        // --- SILHOUETTE SCORE CALCULATION ---
+        function calculateSilhouetteScore(X, assignments, centroids) {
+            const n = X.length;
+            if (n < 2) return 0;
+
+            let totalSil = 0;
+
+            for (let i = 0; i < n; i++) {
+                const ownCluster = assignments[i];
+                let a = 0;
+                let ownCount = 0;
+
+                const otherClusterDists = {};
+
+                for (let j = 0; j < n; j++) {
+                    let d = 0;
+                    for (let f = 0; f < 3; f++) d += Math.pow(X[i][f] - X[j][f], 2);
+                    d = Math.sqrt(d);
+
+                    if (assignments[j] === ownCluster) {
+                        a += d;
+                        ownCount++;
+                    } else {
+                        const otherC = assignments[j];
+                        if (!otherClusterDists[otherC]) otherClusterDists[otherC] = { sum: 0, count: 0 };
+                        otherClusterDists[otherC].sum += d;
+                        otherClusterDists[otherC].count++;
+                    }
+                }
+
+                a = ownCount > 1 ? a / (ownCount - 1) : 0;
+
+                let b = Infinity;
+                Object.keys(otherClusterDists).forEach(cKey => {
+                    const avgD = otherClusterDists[cKey].sum / otherClusterDists[cKey].count;
+                    if (avgD < b) b = avgD;
+                });
+
+                if (b === Infinity) b = 0;
+
+                const maxAB = Math.max(a, b);
+                const s = maxAB > 0 ? (b - a) / maxAB : 0;
+                totalSil += s;
+            }
+
+            return totalSil / n;
+        }
+
+        // --- RENDERING CHARTS & TABLES ---
+        function renderDashboards(rfmList, elbowData, silhouetteData, kSelected) {
+            // Metrics Calculations
+            const totalCust = rfmList.length;
+            const avgRec = (rfmList.reduce((acc, r) => acc + r.Recency, 0) / totalCust).toFixed(1);
+            const avgFreq = (rfmList.reduce((acc, r) => acc + r.Frequency, 0) / totalCust).toFixed(1);
+            const avgSpend = (rfmList.reduce((acc, r) => acc + r.Monetary, 0) / totalCust).toFixed(2);
+
+            document.getElementById('metricTotalCust').textContent = totalCust.toLocaleString();
+            document.getElementById('metricAvgRecency').textContent = avgRec;
+            document.getElementById('metricAvgFreq').textContent = avgFreq;
+            document.getElementById('metricAvgSpend').textContent = `$${parseFloat(avgSpend).toLocaleString()}`;
+
+            // Segment Distribution Donut Chart
+            const segmentCounts = {};
+            rfmList.forEach(r => segmentCounts[r.Segment] = (segmentCounts[r.Segment] || 0) + 1);
+
+            Plotly.newPlot('plotPie', [{
+                labels: Object.keys(segmentCounts),
+                values: Object.values(segmentCounts),
+                type: 'pie',
+                hole: 0.4,
+                marker: { colors: ['#66c2a5','#fc8d62','#8da0cb','#e78ac3','#a6d854','#ffd92f'] }
+            }], { margin: { t: 10, b: 10, l: 10, r: 10 } }, { responsive: true });
+
+            // Scatter Plot: Frequency vs Spend
+            const segments = Array.from(new Set(rfmList.map(r => r.Segment)));
+            const scatterTraces = segments.map(seg => {
+                const sub = rfmList.filter(r => r.Segment === seg);
+                return {
+                    x: sub.map(r => r.Frequency),
+                    y: sub.map(r => r.Monetary),
+                    text: sub.map(r => `Customer: ${r.CustomerID}<br>Recency: ${r.Recency} days`),
+                    mode: 'markers',
+                    name: seg,
+                    marker: { size: sub.map(r => Math.max(6, 20 - r.Recency / 20)) }
+                };
+            });
+
+            Plotly.newPlot('plotScatter', scatterTraces, {
+                xaxis: { title: 'Frequency (Orders)', type: 'log' },
+                yaxis: { title: 'Monetary ($)', type: 'log' },
+                margin: { t: 10, b: 40, l: 50, r: 10 }
+            }, { responsive: true });
+
+            // Table Rendering
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+            rfmList.slice(0, 100).forEach(r => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="p-2.5 font-medium text-gray-800">${r.CustomerID}</td>
+                    <td class="p-2.5"><span class="bg-blue-50 text-blue-700 font-semibold px-2 py-0.5 rounded-full border border-blue-200">${r.Segment}</span></td>
+                    <td class="p-2.5">${r.Recency}</td>
+                    <td class="p-2.5">${r.Frequency}</td>
+                    <td class="p-2.5 font-medium">$${r.Monetary.toFixed(2)}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            // Elbow Plot
+            Plotly.newPlot('plotElbow', [{
+                x: elbowData.map(d => d.k),
+                y: elbowData.map(d => d.wcss),
+                type: 'scatter',
+                mode: 'lines+markers',
+                marker: { color: '#2563eb', size: 8 },
+                line: { shape: 'spline' }
+            }], {
+                xaxis: { title: 'Number of Clusters (K)' },
+                yaxis: { title: 'WCSS' },
+                shapes: [{ type: 'line', x0: kSelected, x1: kSelected, y0: 0, y1: 1, yref: 'paper', line: { color: 'red', dash: 'dash' } }],
+                margin: { t: 10, b: 40, l: 50, r: 10 }
+            }, { responsive: true });
+
+            // Silhouette Score Chart
+            let bestKObj = { k: 2, score: -1 };
+            silhouetteData.forEach(d => { if (d.score > bestKObj.score) bestKObj = d; });
+
+            Plotly.newPlot('plotSilhouette', [{
+                x: silhouetteData.map(d => d.k),
+                y: silhouetteData.map(d => d.score),
+                type: 'bar',
+                marker: { color: '#60a5fa' }
+            }], {
+                xaxis: { title: 'Number of Clusters (K)' },
+                yaxis: { title: 'Silhouette Score' },
+                shapes: [{ type: 'line', x0: kSelected, x1: kSelected, y0: 0, y1: 1, yref: 'paper', line: { color: 'red', dash: 'dash' } }],
+                margin: { t: 10, b: 40, l: 50, r: 10 }
+            }, { responsive: true });
+
+            document.getElementById('silhouetteWinnerBox').innerHTML = `
+                🏆 <strong>Highest Silhouette Score:</strong> K = ${bestKObj.k} (Score: ${bestKObj.score.toFixed(3)}). 
+                This indicates the cleanest cluster separation for this dataset.
+            `;
+        }
+
+        // CSV Export Helper
+        function downloadCSV() {
+            if (!processedRfmResults || processedRfmResults.length === 0) return;
+            
+            const headers = ["CustomerID", "Customer Segment", "Recency", "Frequency", "Monetary"];
+            const csvRows = [headers.join(",")];
+
+            processedRfmResults.forEach(r => {
+                csvRows.push([
+                    `"${r.CustomerID}"`,
+                    `"${r.Segment}"`,
+                    r.Recency,
+                    r.Frequency,
+                    r.Monetary.toFixed(2)
+                ].join(","));
+            });
+
+            const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.setAttribute("href", url);
+            a.setAttribute("download", "rfm_segmented_customers.csv");
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+    </script>
+</body>
+</html>
